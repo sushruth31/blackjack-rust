@@ -1,16 +1,13 @@
 mod utils;
 use rand::Rng;
-use std::{
-    borrow::{Borrow, BorrowMut},
-    collections::HashMap,
-    io::{Read, Write},
-    net::{TcpListener, TcpStream},
-    pin::Pin,
-    sync::Arc,
-};
+use std::{borrow::Borrow, collections::HashMap, sync::Arc};
 use utils::*;
 
-use tokio::sync::{mpsc, Mutex};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::TcpListener,
+    sync::{mpsc, Mutex},
+};
 
 #[derive(Clone, Debug)]
 struct Player {
@@ -57,22 +54,10 @@ impl Game {
     }
 }
 
-type PlayerChannels = Arc<
-    Mutex<
-        HashMap<
-            String,
-            (
-                mpsc::Sender<String>,
-                Arc<Mutex<mpsc::Receiver<String>>>,
-                TcpStream,
-            ),
-        >,
-    >,
->;
+type PlayerChannels = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("localhost:8080")?;
+async fn main() {
     let player_lobby: Arc<Mutex<Vec<Player>>> = Arc::new(Mutex::new(Vec::new()));
     let player_lobby_clone = player_lobby.clone();
     let player_channels: PlayerChannels = Arc::new(Mutex::new(HashMap::new()));
@@ -90,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let broadcast = |msg: String, from: String| async move {
         let player_channels = Arc::clone(&player_channels_clone2);
         let player_channels = player_channels.lock().await;
-        player_channels.iter().for_each(|(id, (tx, rx, stream))| {
+        player_channels.iter().for_each(|(id, tx)| {
             if id != &from {
                 let res = tx.try_send(msg.clone());
                 if res.is_err() {
@@ -129,10 +114,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{} {}, joined the game", player.name, player.id);
                 //get the channel for the player to send messages to
                 let mut channels = player_channels.lock().await;
-                let (channel, rx, stream) = channels.get_mut(&player.id).unwrap();
+                let channel = channels.get_mut(&player.id).unwrap();
                 //send the player a message that they have joined the game
                 channel
-                    .send(format!("You have joined the game, {}!", player.name))
+                    .send(format!("You have joined the game, {}!\n", player.name))
                     .await
                     .unwrap();
                 //need to drop the lock on the channels before broadcasting
@@ -140,76 +125,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drop(game);
                 //send all other players a message that a new player has joined
                 broadcast(
-                    format!("Testing the brocast. {} joined the game", player.name,),
+                    format!("Testing the brocast. {} joined the game\n", player.name,),
                     player.id.clone(),
                 )
                 .await;
                 //loop through all the players and deal them cards
                 let channels = player_channels.lock().await;
-                let (tx, rx, stream) = channels.get(&player.id).unwrap();
-                let mut rx = rx.lock().await;
-                tx.send(format!("Ok, {}, it's your turn. Place a bet", player.name))
-                    .await
-                    .unwrap();
+                let tx = channels.get(&player.id).unwrap();
+                tx.send(format!(
+                    "Ok, {}, it's your turn. Place a bet\n",
+                    player.name
+                ))
+                .await
+                .unwrap();
                 //await the player to send a message back that is a number
-                let mut buf = [0; 1024];
-                let mut stream = stream.try_clone().unwrap();
-                let mut bet = 0;
-                loop {
-                    let n = stream.read(&mut buf).unwrap();
-                    let msg = String::from_utf8_lossy(&buf[..n]);
-                    let msg = msg.trim();
-                    if let Ok(_bet) = msg.parse::<i32>() {
-                        if _bet > 0 {
-                            tx.send(format!("You bet {}", _bet)).await.unwrap();
-                            bet = _bet;
-                            break;
-                        }
-                    }
-                    tx.send("Please enter a valid bet".to_owned())
-                        .await
-                        .unwrap();
-                }
             }
         }
     });
 
-    for stream in listener.incoming() {
+    let listener = TcpListener::bind("localhost:8080").await.unwrap();
+    loop {
+        let (mut stream, id) = listener.accept().await.unwrap();
         let lobby = Arc::clone(&player_lobby_clone);
         let player_channels_clone = Arc::clone(&player_channels_clone);
         tokio::spawn(async move {
-            let mut stream = stream.unwrap();
             let mut name = [0; 32];
             stream
-                .write("Welcome to blackjack. Please type your name to proceed \n".as_bytes())
+                .write_all("Welcome to blackjack. Please type your name to proceed \n".as_bytes())
+                .await
                 .unwrap();
             //read the name of the player
-            stream.read(&mut name).unwrap();
+            stream.read(&mut name).await.unwrap();
             let name = String::from_utf8(name.to_vec()).unwrap();
             //add the player to the lobby
-            let id = stream.peer_addr().unwrap().to_string();
             let mut lobby = lobby.lock().await;
             let mut player_channels = player_channels_clone.lock().await;
             //create a channel for the player and add it to the hashmap
-            let (tx, rx) = mpsc::channel(32);
-            let rx = Arc::new(Mutex::new(rx));
-            let rx_copy = rx.clone();
-            let stream_copy = stream.try_clone().unwrap();
-            player_channels.insert(id.clone(), (tx, rx_copy, stream_copy));
-            lobby.push(Player::new(&name, &id));
+            let (tx, mut rx) = mpsc::channel(32);
+            player_channels.insert(id.to_string(), tx);
+            lobby.push(Player::new(&name, &id.to_string()));
+            stream
+                .write_all(
+                    "You have joined the lobby. Waiting for other players to join... \n".as_bytes(),
+                )
+                .await
+                .unwrap();
             drop(lobby);
             drop(player_channels);
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
             loop {
-                let mut rx = rx.lock().await;
-                //read messages from channel and send them to the player
-                if let Some(message) = rx.recv().await {
-                    stream.write(message.as_bytes()).unwrap();
+                tokio::select! {
+                    Some(msg) = rx.recv() => {
+                        //write to the stream
+                        writer.write_all(msg.as_bytes()).await.unwrap();
+                    }
+                    Ok(result) = reader.read_line(&mut line) => {
+                        if result == 0 {
+                            println!("{} disconnected", id);
+                            break;
+                        }
+                        writer.write_all(line.as_bytes()).await.unwrap();
+                    }
                 }
             }
             //add the player to the lobby
         });
     }
-    Ok(())
 }
 
 #[derive(Clone, Debug)]
