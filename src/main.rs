@@ -40,6 +40,7 @@ struct Game {
     player_pool: Vec<Player>,
     deck: Deck,
     dealer: Dealer,
+    in_progress: bool,
 }
 
 impl Game {
@@ -69,6 +70,7 @@ async fn main() {
         player_pool: Vec::new(),
         deck,
         dealer: Dealer { cards: Vec::new() },
+        in_progress: false,
     }));
 
     //function that will send to all players in the game
@@ -80,8 +82,6 @@ async fn main() {
                 let res = tx.try_send(msg.clone());
                 if res.is_err() {
                     println!("Error sending to player {}", id);
-                } else {
-                    println!("Sent to player {}", id);
                 }
             }
         });
@@ -93,7 +93,7 @@ async fn main() {
         loop {
             let mut game = game.lock().await;
             //if no players in lobby wait
-            if player_lobby.lock().await.len() == 0 {
+            if player_lobby.lock().await.len() == 0 || game.in_progress {
                 continue;
             }
             if game.borrow().deck.0.len() < 10 {
@@ -106,29 +106,29 @@ async fn main() {
             } else {
                 continue;
             }
-            let mut players = player_lobby.lock().await;
-            for player in players.drain(..) {
-                let mut game = game.clone();
-                let broadcast = broadcast.clone();
-                game.add_player(&player.name, &player.id);
-                println!("{} {}, joined the game", player.name, player.id);
-                //get the channel for the player to send messages to
+            let mut lobbyplayers = player_lobby.lock().await;
+            //add each player to the game.
+            for player in lobbyplayers.drain(..) {
                 let mut channels = player_channels.lock().await;
                 let channel = channels.get_mut(&player.id).unwrap();
-                //send the player a message that they have joined the game
                 channel
                     .send(format!("You have joined the game, {}!\n", player.name))
                     .await
                     .unwrap();
-                //need to drop the lock on the channels before broadcasting
+                println!("{} {}, joined the game", player.name, player.id);
+
+                game.add_player(&player.name, &player.id);
+                let broadcast = broadcast.clone();
                 drop(channels);
-                drop(game);
-                //send all other players a message that a new player has joined
                 broadcast(
                     format!("Testing the brocast. {} joined the game\n", player.name,),
                     player.id.clone(),
                 )
                 .await;
+            }
+            let mut game = game.clone();
+            for player in game.player_pool.iter() {
+                game.in_progress = true;
                 //loop through all the players and deal them cards
                 let channels = player_channels.lock().await;
                 let tx = channels.get(&player.id).unwrap();
