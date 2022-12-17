@@ -60,8 +60,10 @@ type PlayerChannels = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
 #[tokio::main]
 async fn main() {
     let player_lobby: Arc<Mutex<Vec<Player>>> = Arc::new(Mutex::new(Vec::new()));
+    let player_bet_pool: Arc<Mutex<HashMap<String, i32>>> = Arc::new(Mutex::new(HashMap::new()));
     let player_lobby_clone = player_lobby.clone();
     let player_channels: PlayerChannels = Arc::new(Mutex::new(HashMap::new()));
+    let current_player: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let player_channels_clone = player_channels.clone();
     let player_channels_clone2 = player_channels.clone();
     let mut deck = Deck::new();
@@ -72,6 +74,7 @@ async fn main() {
         dealer: Dealer { cards: Vec::new() },
         in_progress: false,
     }));
+    let current_player_clone = current_player.clone();
 
     //function that will send to all players in the game
     let broadcast = |msg: String, from: String| async move {
@@ -127,9 +130,20 @@ async fn main() {
                 .await;
             }
             let mut game = game.clone();
+            let current_player = current_player_clone.clone();
             for player in game.player_pool.iter() {
+                let mut current_player = current_player.lock().await;
+                if current_player.is_none() {
+                    *current_player = Some(player.id.clone());
+                }
+                drop(current_player);
                 game.in_progress = true;
                 //loop through all the players and deal them cards
+                let channels = player_channels.lock().await;
+                //send all the other players a mesage saying they need to wait for the current player to bet
+                let broadcast = broadcast.clone();
+                drop(channels);
+                broadcast(format!("{} is betting\n", player.name), player.id.clone()).await;
                 let channels = player_channels.lock().await;
                 let tx = channels.get(&player.id).unwrap();
                 tx.send(format!(
@@ -138,16 +152,20 @@ async fn main() {
                 ))
                 .await
                 .unwrap();
-                //await the player to send a message back that is a number
+                drop(channels);
             }
         }
     });
 
     let listener = TcpListener::bind("localhost:8080").await.unwrap();
+    let player_bet_pool_clone = player_bet_pool.clone();
+    let current_player_clone = current_player.clone();
     loop {
         let (mut stream, id) = listener.accept().await.unwrap();
         let lobby = Arc::clone(&player_lobby_clone);
         let player_channels_clone = Arc::clone(&player_channels_clone);
+        let player_bet_pool_clone = Arc::clone(&player_bet_pool_clone);
+        let current_player = Arc::clone(&current_player_clone);
         tokio::spawn(async move {
             let mut name = [0; 32];
             stream
@@ -161,7 +179,7 @@ async fn main() {
             let mut lobby = lobby.lock().await;
             let mut player_channels = player_channels_clone.lock().await;
             //create a channel for the player and add it to the hashmap
-            let (tx, mut rx) = mpsc::channel(32);
+            let (tx, mut rx) = mpsc::channel::<String>(32);
             player_channels.insert(id.to_string(), tx);
             lobby.push(Player::new(&name, &id.to_string()));
             stream
@@ -182,11 +200,24 @@ async fn main() {
                         writer.write_all(msg.as_bytes()).await.unwrap();
                     }
                     Ok(result) = reader.read_line(&mut line) => {
+                        let mut player_bet_pool = player_bet_pool_clone.lock().await;
                         if result == 0 {
                             println!("{} disconnected", id);
                             break;
                         }
-                        writer.write_all(line.as_bytes()).await.unwrap();
+                        if let Ok(bet) = line.trim().parse::<i32>() {
+                            //need to check if the current player is the one who is betting
+                            let current_player = current_player.lock().await;
+                            if let Some(current_player_id) = &*current_player {
+                                if current_player_id == &id.to_string() {
+                                    player_bet_pool.insert(id.to_string(), bet);
+                                    println!("{} bet {}", id, bet);
+                                } else {
+                                    println!("{} tried to bet but it's not their turn", id);
+                                }
+                            }
+                        }
+                        line.clear();
                     }
                 }
             }
