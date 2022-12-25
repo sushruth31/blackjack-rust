@@ -1,5 +1,4 @@
 mod utils;
-use rand::Rng;
 use std::{borrow::Borrow, collections::HashMap, sync::Arc};
 use utils::*;
 
@@ -9,58 +8,12 @@ use tokio::{
     sync::{mpsc, Mutex},
 };
 
-#[derive(Clone, Debug)]
-struct Player {
-    name: String,
-    money: i32,
-    current_bet: i32,
-    id: String,
-    cards: Vec<Card>,
-}
-
-impl Player {
-    fn new(name: &str, id: &str) -> Self {
-        Self {
-            name: name.to_string(),
-            money: 100,
-            current_bet: 0,
-            id: id.to_string(),
-            cards: Vec::new(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct Dealer {
-    cards: Vec<Card>,
-}
-
-#[derive(Clone, Debug)]
-struct Game {
-    player_pool: Vec<Player>,
-    deck: Deck,
-    dealer: Dealer,
-    in_progress: bool,
-}
-
-impl Game {
-    fn add_player(&mut self, name: &str, id: &str) {
-        self.player_pool.push(Player {
-            name: name.to_string(),
-            money: 100,
-            current_bet: 0,
-            id: id.to_string(),
-            cards: Vec::new(),
-        });
-    }
-}
-
 type PlayerChannels = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
 
 #[tokio::main]
 async fn main() {
     let player_lobby: Arc<Mutex<Vec<Player>>> = Arc::new(Mutex::new(Vec::new()));
-    let player_bet_pool: Arc<Mutex<HashMap<String, i32>>> = Arc::new(Mutex::new(HashMap::new()));
+    let player_bet_pool: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
     let player_bet_pool_clone = player_bet_pool.clone();
     let player_lobby_clone = player_lobby.clone();
     let player_channels: PlayerChannels = Arc::new(Mutex::new(HashMap::new()));
@@ -91,6 +44,13 @@ async fn main() {
         });
     };
 
+    let send_tx: Box<dyn Fn(&str, &mpsc::Sender<String>) + Send> = Box::new(|msg, tx| {
+        let res = tx.try_send(msg.to_string());
+        if res.is_err() {
+            println!("Error sending to player");
+        }
+    });
+
     tokio::spawn(async move {
         let game = Arc::clone(&game);
         //move players from lobby to game
@@ -104,12 +64,6 @@ async fn main() {
             if game.borrow().deck.0.len() < 10 {
                 game.deck = Deck::new();
                 game.deck.shuffle();
-            }
-            //give the dealer a card
-            if let Some(card) = game.deck.deal_card() {
-                game.dealer.cards.push(card);
-            } else {
-                continue;
             }
             //add each player to the game.
             for player in lobbyplayers.drain(..) {
@@ -133,7 +87,15 @@ async fn main() {
             drop(lobbyplayers);
             let mut game = game.clone();
             let current_player = current_player_clone.clone();
-            for player in game.player_pool.iter() {
+            //give the dealer a card
+            if let Some(card) = game.deck.deal_card() {
+                game.dealer.cards.push(card);
+            } else {
+                //if the deck is empty, shuffle and deal a card
+                game.deck = Deck::new();
+                game.dealer.cards.push(game.deck.deal_card().unwrap());
+            }
+            for player in game.player_pool.iter_mut() {
                 let mut current_player = current_player.lock().await;
                 *current_player = Some(player.id.clone());
                 drop(current_player);
@@ -143,45 +105,62 @@ async fn main() {
                 //send all the other players a mesage saying they need to wait for the current player to bet
                 let broadcast_clone = broadcast.clone();
                 drop(channels);
-                broadcast_clone(format!("{} is betting\n", player.name), player.id.clone()).await;
+                broadcast_clone(format!("{} is betting\n", &player.name), player.id.clone()).await;
                 let channels = player_channels.lock().await;
                 let tx = channels.get(&player.id).unwrap();
-                tx.send(format!(
-                    "Ok, {}, it's your turn. Place a bet\n",
-                    player.name
-                ))
-                .await
-                .unwrap();
+
+                //present the player with the dealer's cards
+                send_tx(&display_cards(&game.dealer), &tx);
+                send_tx(&format!("Ok, {} it's your turn\n", player.name), tx);
+                //deal the player two cards
+                if let Some(card) = game.deck.deal_card() {
+                    player.cards.push(card);
+                } else {
+                    //if there are no more cards in the deck reshuffle
+                    game.deck = Deck::new();
+                    game.deck.shuffle();
+                    player.cards.push(game.deck.deal_card().unwrap());
+                }
+                //show the player their cards
+                send_tx(&display_cards(player), tx);
                 drop(channels);
                 //continusly loop until player has placed a bet sleeping in order to yield the thread
+                let player_bet: u32;
                 loop {
-                    let channels = player_channels.lock().await;
-                    let tx = channels.get(&player.id).unwrap();
-                    let broadcast_clone = broadcast.clone();
                     let player_bet_pool = player_bet_pool_clone.lock().await;
                     if player_bet_pool.contains_key(&player.id) {
-                        tx.send(format!(
-                            "You have bet ${}\n",
-                            player_bet_pool.get(&player.id).unwrap()
-                        ))
-                        .await
-                        .unwrap();
-                        drop(channels);
-                        broadcast_clone(
-                            format!(
-                                "{} has bet ${}\n",
-                                player.name,
-                                player_bet_pool.get(&player.id).unwrap()
-                            ),
-                            player.id.clone(),
-                        )
-                        .await;
+                        player_bet = *player_bet_pool.get(&player.id).unwrap();
                         break;
                     }
+                    //remove the amount of money from the player
                     drop(player_bet_pool);
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
+                player.money -= player_bet;
+                let channels = player_channels.lock().await;
+                let tx = channels.get(&player.id).unwrap();
+                let player_bet_pool = player_bet_pool_clone.lock().await;
+                tx.send(format!("You have bet ${}\n", &player_bet))
+                    .await
+                    .unwrap();
+                let broadcast_clone = broadcast.clone();
+                tx.send(format!("You have ${} left\n", player.money))
+                    .await
+                    .unwrap();
+                drop(channels);
+                broadcast_clone(
+                    format!(
+                        "{} has bet ${}\n",
+                        player.name,
+                        player_bet_pool.get(&player.id).unwrap()
+                    ),
+                    player.id.clone(),
+                )
+                .await;
+                player.money -= player_bet;
             }
+            //reset the player bet pool for the next round
+            reset_game(player_bet_pool_clone.clone(), &mut game).await;
         }
     });
 
@@ -233,7 +212,7 @@ async fn main() {
                             println!("{} disconnected", id);
                             break;
                         }
-                        if let Ok(bet) = line.trim().parse::<i32>() {
+                        if let Ok(bet) = line.trim().parse::<u32>() {
                             //need to check if the current player is the one who is betting
                             let current_player = current_player.lock().await;
                             if let Some(current_player_id) = &*current_player {
@@ -254,37 +233,5 @@ async fn main() {
             }
             //add the player to the lobby
         });
-    }
-}
-
-#[derive(Clone, Debug)]
-struct Deck(Vec<Card>);
-
-impl Deck {
-    fn new() -> Self {
-        let nums = vec![2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
-        let symbols = vec!["♠", "♥", "♦", "♣"];
-        let mut deck: Vec<Card> = Vec::new();
-        for num in nums {
-            for symbol in &symbols {
-                deck.push(Card {
-                    suit: symbol.to_string(),
-                    value: num,
-                });
-            }
-        }
-        return Self(deck);
-    }
-
-    fn shuffle(&mut self) {
-        let cards = &mut self.0;
-        for i in 0..cards.len() {
-            let rand = rand::thread_rng().gen_range(0..cards.len());
-            cards.swap(i, rand);
-        }
-    }
-
-    fn deal_card(&mut self) -> Option<Card> {
-        return self.0.pop();
     }
 }
