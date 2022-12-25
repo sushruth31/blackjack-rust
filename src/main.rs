@@ -61,6 +61,7 @@ type PlayerChannels = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
 async fn main() {
     let player_lobby: Arc<Mutex<Vec<Player>>> = Arc::new(Mutex::new(Vec::new()));
     let player_bet_pool: Arc<Mutex<HashMap<String, i32>>> = Arc::new(Mutex::new(HashMap::new()));
+    let player_bet_pool_clone = player_bet_pool.clone();
     let player_lobby_clone = player_lobby.clone();
     let player_channels: PlayerChannels = Arc::new(Mutex::new(HashMap::new()));
     let current_player: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -95,8 +96,9 @@ async fn main() {
         //move players from lobby to game
         loop {
             let mut game = game.lock().await;
-            //if no players in lobby wait
-            if player_lobby.lock().await.len() == 0 || game.in_progress {
+            //wait for at least 2 players in the lobby to start the game
+            let mut lobbyplayers = player_lobby.lock().await;
+            if lobbyplayers.len() >= 2 {
                 continue;
             }
             if game.borrow().deck.0.len() < 10 {
@@ -109,7 +111,6 @@ async fn main() {
             } else {
                 continue;
             }
-            let mut lobbyplayers = player_lobby.lock().await;
             //add each player to the game.
             for player in lobbyplayers.drain(..) {
                 let mut channels = player_channels.lock().await;
@@ -129,21 +130,20 @@ async fn main() {
                 )
                 .await;
             }
+            drop(lobbyplayers);
             let mut game = game.clone();
             let current_player = current_player_clone.clone();
             for player in game.player_pool.iter() {
                 let mut current_player = current_player.lock().await;
-                if current_player.is_none() {
-                    *current_player = Some(player.id.clone());
-                }
+                *current_player = Some(player.id.clone());
                 drop(current_player);
                 game.in_progress = true;
                 //loop through all the players and deal them cards
                 let channels = player_channels.lock().await;
                 //send all the other players a mesage saying they need to wait for the current player to bet
-                let broadcast = broadcast.clone();
+                let broadcast_clone = broadcast.clone();
                 drop(channels);
-                broadcast(format!("{} is betting\n", player.name), player.id.clone()).await;
+                broadcast_clone(format!("{} is betting\n", player.name), player.id.clone()).await;
                 let channels = player_channels.lock().await;
                 let tx = channels.get(&player.id).unwrap();
                 tx.send(format!(
@@ -153,6 +153,34 @@ async fn main() {
                 .await
                 .unwrap();
                 drop(channels);
+                //continusly loop until player has placed a bet sleeping in order to yield the thread
+                loop {
+                    let channels = player_channels.lock().await;
+                    let tx = channels.get(&player.id).unwrap();
+                    let broadcast_clone = broadcast.clone();
+                    let player_bet_pool = player_bet_pool_clone.lock().await;
+                    if player_bet_pool.contains_key(&player.id) {
+                        tx.send(format!(
+                            "You have bet ${}\n",
+                            player_bet_pool.get(&player.id).unwrap()
+                        ))
+                        .await
+                        .unwrap();
+                        drop(channels);
+                        broadcast_clone(
+                            format!(
+                                "{} has bet ${}\n",
+                                player.name,
+                                player_bet_pool.get(&player.id).unwrap()
+                            ),
+                            player.id.clone(),
+                        )
+                        .await;
+                        break;
+                    }
+                    drop(player_bet_pool);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
             }
         }
     });
@@ -209,9 +237,12 @@ async fn main() {
                             //need to check if the current player is the one who is betting
                             let current_player = current_player.lock().await;
                             if let Some(current_player_id) = &*current_player {
+                                println!("current player : {}", current_player_id);
                                 if current_player_id == &id.to_string() {
+                                    drop(current_player);
                                     player_bet_pool.insert(id.to_string(), bet);
-                                    println!("{} bet {}", id, bet);
+                                    drop(player_bet_pool);
+                                    // println!("{} bet {}", id, bet);
                                 } else {
                                     println!("{} tried to bet but it's not their turn", id);
                                 }
