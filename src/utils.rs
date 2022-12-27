@@ -76,6 +76,22 @@ pub struct Dealer {
     pub cards: Vec<Card>,
 }
 
+trait DealCard {
+    fn deal_card(&mut self, card: Card);
+}
+
+impl DealCard for Player {
+    fn deal_card(&mut self, card: Card) {
+        self.cards.push(card);
+    }
+}
+
+impl DealCard for Dealer {
+    fn deal_card(&mut self, card: Card) {
+        self.cards.push(card);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Game {
     pub player_pool: Vec<Player>,
@@ -84,7 +100,16 @@ pub struct Game {
     pub in_progress: bool,
 }
 
+pub enum DealerOrPlayer {
+    Dealer,
+    Player,
+}
+
 impl Game {
+    pub fn reset_deck(&mut self) {
+        self.deck = Deck::new();
+    }
+
     pub fn add_player(&mut self, name: &str, id: &str) {
         self.player_pool.push(Player {
             name: name.to_string(),
@@ -93,6 +118,22 @@ impl Game {
             id: id.to_string(),
             cards: Vec::new(),
         });
+    }
+
+    pub fn deal_card(&mut self, to: DealerOrPlayer, player_id: Option<&str>) {
+        let card = self.deck.draw_card();
+        match to {
+            DealerOrPlayer::Dealer => {
+                self.dealer.deal_card(card);
+            }
+            DealerOrPlayer::Player => {
+                self.player_pool
+                    .iter_mut()
+                    .find(|player| player.id == player_id.unwrap())
+                    .unwrap()
+                    .deal_card(card);
+            }
+        }
     }
 }
 
@@ -123,8 +164,14 @@ impl Deck {
         }
     }
 
-    pub fn deal_card(&mut self) -> Option<Card> {
-        return self.0.pop();
+    pub fn draw_card(&mut self) -> Card {
+        let card = if let Some(card) = self.0.pop() {
+            card
+        } else {
+            self.shuffle();
+            self.0.pop().unwrap()
+        };
+        return card;
     }
 }
 

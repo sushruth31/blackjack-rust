@@ -55,15 +55,15 @@ async fn main() {
         let game = Arc::clone(&game);
         //move players from lobby to game
         loop {
-            let mut game = game.lock().await;
+            let mut game_clone = game.lock().await;
             //wait for at least 2 players in the lobby to start the game
             let mut lobbyplayers = player_lobby.lock().await;
             if lobbyplayers.len() >= 2 {
                 continue;
             }
-            if game.borrow().deck.0.len() < 10 {
-                game.deck = Deck::new();
-                game.deck.shuffle();
+            if game_clone.borrow().deck.0.len() < 10 {
+                game_clone.deck = Deck::new();
+                game_clone.deck.shuffle();
             }
             //add each player to the game.
             for player in lobbyplayers.drain(..) {
@@ -75,7 +75,7 @@ async fn main() {
                     .unwrap();
                 println!("{} {}, joined the game", player.name, player.id);
 
-                game.add_player(&player.name, &player.id);
+                game_clone.add_player(&player.name, &player.id);
                 let broadcast = broadcast.clone();
                 drop(channels);
                 broadcast(
@@ -85,21 +85,13 @@ async fn main() {
                 .await;
             }
             drop(lobbyplayers);
-            let mut game = game.clone();
+            let mut game_clone = game_clone.clone();
             let current_player = current_player_clone.clone();
-            //give the dealer a card
-            if let Some(card) = game.deck.deal_card() {
-                game.dealer.cards.push(card);
-            } else {
-                //if the deck is empty, shuffle and deal a card
-                game.deck = Deck::new();
-                game.dealer.cards.push(game.deck.deal_card().unwrap());
-            }
-            for player in game.player_pool.iter_mut() {
+            for player in game_clone.player_pool.iter_mut() {
                 let mut current_player = current_player.lock().await;
                 *current_player = Some(player.id.clone());
                 drop(current_player);
-                game.in_progress = true;
+                game_clone.in_progress = true;
                 //loop through all the players and deal them cards
                 let channels = player_channels.lock().await;
                 //send all the other players a mesage saying they need to wait for the current player to bet
@@ -110,17 +102,12 @@ async fn main() {
                 let tx = channels.get(&player.id).unwrap();
 
                 //present the player with the dealer's cards
-                send_tx(&display_cards(&game.dealer), &tx);
+                send_tx(&display_cards(&game_clone.dealer), &tx);
                 send_tx(&format!("Ok, {} it's your turn\n", player.name), tx);
-                //deal the player two cards
-                if let Some(card) = game.deck.deal_card() {
-                    player.cards.push(card);
-                } else {
-                    //if there are no more cards in the deck reshuffle
-                    game.deck = Deck::new();
-                    game.deck.shuffle();
-                    player.cards.push(game.deck.deal_card().unwrap());
-                }
+                //deal the a card;
+                //TODO MAKE THIS A FUNCTION
+                let card1 = game_clone.deck.draw_card();
+                let card2 = game_clone.deck.draw_card();
                 //show the player their cards
                 send_tx(&display_cards(player), tx);
                 drop(channels);
@@ -159,8 +146,10 @@ async fn main() {
                 .await;
                 player.money -= player_bet;
             }
+            //dealers turn
+            game_clone.deal_card(DealerOrPlayer::Dealer, None);
             //reset the player bet pool for the next round
-            reset_game(player_bet_pool_clone.clone(), &mut game).await;
+            reset_game(player_bet_pool_clone.clone(), &mut game_clone).await;
         }
     });
 
