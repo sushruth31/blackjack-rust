@@ -1,226 +1,169 @@
-mod utils;
-use std::{borrow::Borrow, collections::HashMap, sync::Arc};
-use utils::*;
+//! TCP front end for the blackjack table.
+//!
+//! One task owns the [`Table`] and is the only thing that mutates it, so the
+//! rules need no locks. Every connection is two tasks — a reader that turns
+//! lines into commands and a writer that drains a bounded mailbox — which
+//! avoids `select!` over [`AsyncBufReadExt::lines`] and the partial-line
+//! problems that come with cancelling a read.
 
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::TcpListener,
-    sync::{mpsc, Mutex},
-};
+use blackjack_rust::config::Config;
+use blackjack_rust::protocol::{self, GREETING, HELP};
+use blackjack_rust::rules::Rules;
+use blackjack_rust::table::{Command, Event, SeatId, Table, TableError};
+use rand::rngs::StdRng;
+use rand::SeedableRng;
+use std::collections::HashMap;
+use std::error::Error;
+use std::io;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
-type PlayerChannels = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
+/// Bounded so that one wedged client cannot make the table allocate forever.
+const MAILBOX_DEPTH: usize = 64;
+const MAX_NAME_LEN: usize = 16;
+
+type Clients = HashMap<SeatId, Sender<String>>;
+
+enum Input {
+    Join { name: String, outbox: Sender<String> },
+    Play(Command),
+    Leave,
+}
+
+struct Request {
+    seat: SeatId,
+    input: Input,
+}
 
 #[tokio::main]
 async fn main() {
-    let player_lobby: Arc<Mutex<Vec<Player>>> = Arc::new(Mutex::new(Vec::new()));
-    let player_bet_pool: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
-    let player_bet_pool_clone = player_bet_pool.clone();
-    let player_lobby_clone = player_lobby.clone();
-    let player_channels: PlayerChannels = Arc::new(Mutex::new(HashMap::new()));
-    let current_player: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let player_channels_clone = player_channels.clone();
-    let player_channels_clone2 = player_channels.clone();
-    let mut deck = Deck::new();
-    deck.shuffle();
-    let game = Arc::new(Mutex::new(Game {
-        player_pool: Vec::new(),
-        deck,
-        dealer: Dealer { cards: Vec::new() },
-        in_progress: false,
-    }));
-    let current_player_clone = current_player.clone();
-
-    //function that will send to all players in the game
-    let broadcast = |msg: String, from: String| async move {
-        let player_channels = Arc::clone(&player_channels_clone2);
-        let player_channels = player_channels.lock().await;
-        player_channels.iter().for_each(|(id, tx)| {
-            if id != &from {
-                let res = tx.try_send(msg.clone());
-                if res.is_err() {
-                    println!("Error sending to player {}", id);
-                }
-            }
-        });
-    };
-
-    let send_tx: Box<dyn Fn(&str, &mpsc::Sender<String>) + Send> = Box::new(|msg, tx| {
-        let res = tx.try_send(msg.to_string());
-        if res.is_err() {
-            println!("Error sending to player");
-        }
-    });
-
-    tokio::spawn(async move {
-        let game = Arc::clone(&game);
-        //move players from lobby to game
-        loop {
-            let mut game_clone = game.lock().await;
-            //wait for at least 2 players in the lobby to start the game
-            let mut lobbyplayers = player_lobby.lock().await;
-            if lobbyplayers.len() >= 2 {
-                continue;
-            }
-            if game_clone.borrow().deck.0.len() < 10 {
-                game_clone.deck = Deck::new();
-                game_clone.deck.shuffle();
-            }
-            //add each player to the game.
-            for player in lobbyplayers.drain(..) {
-                let mut channels = player_channels.lock().await;
-                let channel = channels.get_mut(&player.id).unwrap();
-                channel
-                    .send(format!("You have joined the game, {}!\n", player.name))
-                    .await
-                    .unwrap();
-                println!("{} {}, joined the game", player.name, player.id);
-
-                game_clone.add_player(&player.name, &player.id);
-                let broadcast = broadcast.clone();
-                drop(channels);
-                broadcast(
-                    format!("Testing the brocast. {} joined the game\n", player.name,),
-                    player.id.clone(),
-                )
-                .await;
-            }
-            drop(lobbyplayers);
-            let mut game_clone = game_clone.clone();
-            let current_player = current_player_clone.clone();
-            for player in game_clone.player_pool.iter_mut() {
-                let mut current_player = current_player.lock().await;
-                *current_player = Some(player.id.clone());
-                drop(current_player);
-                game_clone.in_progress = true;
-                //loop through all the players and deal them cards
-                let channels = player_channels.lock().await;
-                //send all the other players a mesage saying they need to wait for the current player to bet
-                let broadcast_clone = broadcast.clone();
-                drop(channels);
-                broadcast_clone(format!("{} is betting\n", &player.name), player.id.clone()).await;
-                let channels = player_channels.lock().await;
-                let tx = channels.get(&player.id).unwrap();
-
-                //present the player with the dealer's cards
-                send_tx(&display_cards(&game_clone.dealer), &tx);
-                send_tx(&format!("Ok, {} it's your turn\n", player.name), tx);
-                //deal the a card;
-                //TODO MAKE THIS A FUNCTION
-                let card1 = game_clone.deck.draw_card();
-                let card2 = game_clone.deck.draw_card();
-                //show the player their cards
-                send_tx(&display_cards(player), tx);
-                drop(channels);
-                //continusly loop until player has placed a bet sleeping in order to yield the thread
-                let player_bet: u32;
-                loop {
-                    let player_bet_pool = player_bet_pool_clone.lock().await;
-                    if player_bet_pool.contains_key(&player.id) {
-                        player_bet = *player_bet_pool.get(&player.id).unwrap();
-                        break;
-                    }
-                    //remove the amount of money from the player
-                    drop(player_bet_pool);
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                player.money -= player_bet;
-                let channels = player_channels.lock().await;
-                let tx = channels.get(&player.id).unwrap();
-                let player_bet_pool = player_bet_pool_clone.lock().await;
-                tx.send(format!("You have bet ${}\n", &player_bet))
-                    .await
-                    .unwrap();
-                let broadcast_clone = broadcast.clone();
-                tx.send(format!("You have ${} left\n", player.money))
-                    .await
-                    .unwrap();
-                drop(channels);
-                broadcast_clone(
-                    format!(
-                        "{} has bet ${}\n",
-                        player.name,
-                        player_bet_pool.get(&player.id).unwrap()
-                    ),
-                    player.id.clone(),
-                )
-                .await;
-                player.money -= player_bet;
-            }
-            //dealers turn
-            game_clone.deal_card(DealerOrPlayer::Dealer, None);
-            //reset the player bet pool for the next round
-            reset_game(player_bet_pool_clone.clone(), &mut game_clone).await;
-        }
-    });
-
-    let listener = TcpListener::bind("localhost:8080").await.unwrap();
-    let player_bet_pool_clone = player_bet_pool.clone();
-    let current_player_clone = current_player.clone();
-    loop {
-        let (mut stream, id) = listener.accept().await.unwrap();
-        let lobby = Arc::clone(&player_lobby_clone);
-        let player_channels_clone = Arc::clone(&player_channels_clone);
-        let player_bet_pool_clone = Arc::clone(&player_bet_pool_clone);
-        let current_player = Arc::clone(&current_player_clone);
-        tokio::spawn(async move {
-            let mut name = [0; 32];
-            stream
-                .write_all("Welcome to blackjack. Please type your name to proceed \n".as_bytes())
-                .await
-                .unwrap();
-            //read the name of the player
-            stream.read(&mut name).await.unwrap();
-            let name = String::from_utf8(name.to_vec()).unwrap();
-            //add the player to the lobby
-            let mut lobby = lobby.lock().await;
-            let mut player_channels = player_channels_clone.lock().await;
-            //create a channel for the player and add it to the hashmap
-            let (tx, mut rx) = mpsc::channel::<String>(32);
-            player_channels.insert(id.to_string(), tx);
-            lobby.push(Player::new(&name, &id.to_string()));
-            stream
-                .write_all(
-                    "You have joined the lobby. Waiting for other players to join... \n".as_bytes(),
-                )
-                .await
-                .unwrap();
-            drop(lobby);
-            drop(player_channels);
-            let (reader, mut writer) = stream.into_split();
-            let mut reader = BufReader::new(reader);
-            let mut line = String::new();
-            loop {
-                tokio::select! {
-                    Some(msg) = rx.recv() => {
-                        //write to the stream
-                        writer.write_all(msg.as_bytes()).await.unwrap();
-                    }
-                    Ok(result) = reader.read_line(&mut line) => {
-                        let mut player_bet_pool = player_bet_pool_clone.lock().await;
-                        if result == 0 {
-                            println!("{} disconnected", id);
-                            break;
-                        }
-                        if let Ok(bet) = line.trim().parse::<u32>() {
-                            //need to check if the current player is the one who is betting
-                            let current_player = current_player.lock().await;
-                            if let Some(current_player_id) = &*current_player {
-                                println!("current player : {}", current_player_id);
-                                if current_player_id == &id.to_string() {
-                                    drop(current_player);
-                                    player_bet_pool.insert(id.to_string(), bet);
-                                    drop(player_bet_pool);
-                                    // println!("{} bet {}", id, bet);
-                                } else {
-                                    println!("{} tried to bet but it's not their turn", id);
-                                }
-                            }
-                        }
-                        line.clear();
-                    }
-                }
-            }
-            //add the player to the lobby
-        });
+    if let Err(error) = run().await {
+        eprintln!("blackjack: {}", error);
+        std::process::exit(1);
     }
+}
+
+async fn run() -> Result<(), Box<dyn Error>> {
+    let config = Config::from_env()?;
+    let listener = TcpListener::bind(&config.bind_addr).await?;
+    println!("blackjack table open on {}", config.bind_addr);
+    let (requests, inbox) = mpsc::channel(MAILBOX_DEPTH);
+    tokio::spawn(run_table(config.rules, inbox));
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        tokio::spawn(serve(stream, peer.to_string(), requests.clone()));
+    }
+}
+
+/// The single owner of the table. Commands arrive in order, so the rules run
+/// on one thread with no shared mutable state at all.
+async fn run_table(rules: Rules, mut inbox: Receiver<Request>) {
+    let mut table = Table::new(rules, StdRng::from_entropy());
+    let mut clients = Clients::new();
+    while let Some(Request { seat, input }) = inbox.recv().await {
+        let result = dispatch(&mut table, &mut clients, &seat, input);
+        publish(&clients, &seat, result);
+    }
+}
+
+fn dispatch(
+    table: &mut Table<StdRng>,
+    clients: &mut Clients,
+    seat: &str,
+    input: Input,
+) -> Result<Vec<Event>, TableError> {
+    match input {
+        Input::Join { name, outbox } => {
+            clients.insert(seat.to_string(), outbox);
+            table.join(seat, &name)
+        }
+        Input::Play(command) => table.apply(seat, command),
+        Input::Leave => {
+            clients.remove(seat);
+            Ok(table.leave(seat))
+        }
+    }
+}
+
+fn publish(clients: &Clients, origin: &str, result: Result<Vec<Event>, TableError>) {
+    let events = match result {
+        Ok(events) => events,
+        Err(error) => return whisper(clients, origin, &format!("{}\n", error)),
+    };
+    events.iter().for_each(|event| announce(clients, &protocol::render(event)));
+}
+
+/// Never awaits: a client that has stopped reading loses lines rather than
+/// stalling the round for everyone else.
+fn announce(clients: &Clients, line: &str) {
+    clients.values().for_each(|outbox| {
+        let _ = outbox.try_send(line.to_string());
+    });
+}
+
+fn whisper(clients: &Clients, seat: &str, line: &str) {
+    if let Some(outbox) = clients.get(seat) {
+        let _ = outbox.try_send(line.to_string());
+    }
+}
+
+async fn serve(stream: TcpStream, seat: SeatId, requests: Sender<Request>) {
+    let (reader, writer) = stream.into_split();
+    let (outbox, mailbox) = mpsc::channel(MAILBOX_DEPTH);
+    tokio::spawn(drain(mailbox, writer));
+    let _ = outbox.try_send(GREETING.to_string());
+    if let Err(error) = read_commands(reader, &seat, &requests, outbox).await {
+        eprintln!("connection {} closed: {}", seat, error);
+    }
+    submit(&requests, &seat, Input::Leave).await;
+}
+
+async fn drain(mut mailbox: Receiver<String>, mut writer: OwnedWriteHalf) {
+    while let Some(line) = mailbox.recv().await {
+        if writer.write_all(line.as_bytes()).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn read_commands(
+    reader: OwnedReadHalf,
+    seat: &str,
+    requests: &Sender<Request>,
+    outbox: Sender<String>,
+) -> io::Result<()> {
+    let mut lines = BufReader::new(reader).lines();
+    let Some(greeting) = lines.next_line().await? else {
+        return Ok(());
+    };
+    let name = seat_name(&greeting, seat);
+    let _ = outbox.try_send(HELP.to_string());
+    submit(requests, seat, Input::Join { name, outbox: outbox.clone() }).await;
+    while let Some(line) = lines.next_line().await? {
+        forward(&line, seat, requests, &outbox).await;
+    }
+    Ok(())
+}
+
+async fn forward(line: &str, seat: &str, requests: &Sender<Request>, outbox: &Sender<String>) {
+    let Some(command) = protocol::parse_command(line) else {
+        let _ = outbox.try_send(HELP.to_string());
+        return;
+    };
+    submit(requests, seat, Input::Play(command)).await;
+}
+
+/// Awaits on purpose: inbound backpressure should slow a chatty client down.
+async fn submit(requests: &Sender<Request>, seat: &str, input: Input) {
+    let _ = requests.send(Request { seat: seat.to_string(), input }).await;
+}
+
+fn seat_name(raw: &str, seat: &str) -> String {
+    let name: String = raw.trim().chars().filter(|c| !c.is_control()).take(MAX_NAME_LEN).collect();
+    if name.is_empty() {
+        return format!("guest-{}", seat);
+    }
+    name
 }

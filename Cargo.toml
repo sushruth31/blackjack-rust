@@ -8,4 +8,10 @@ license = "MIT"
 
 [dependencies]
 rand = "0.8.5"
-tokio = { version = "1.22.0", features = ["full"] }
+tokio = { version = "1.22.0", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "sync",
+] }
