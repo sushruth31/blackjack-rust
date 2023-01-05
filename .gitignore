@@ -1,1 +1,11 @@
 /target
+**/*.rs.bk
+
+# Local configuration; .env.example is the committed template.
+.env
+.env.*
+!.env.example
+
+.DS_Store
+.idea/
+.vscode/
