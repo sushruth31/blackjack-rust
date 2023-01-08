@@ -80,10 +80,7 @@ fn dispatch(
             table.join(seat, &name)
         }
         Input::Play(command) => table.apply(seat, command),
-        Input::Leave => {
-            clients.remove(seat);
-            Ok(table.leave(seat))
-        }
+        Input::Leave => table.leave(seat),
     }
 }
 

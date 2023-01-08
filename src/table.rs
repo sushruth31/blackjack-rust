@@ -145,9 +145,15 @@ impl<R: Rng> Table<R> {
         self.seats.iter().find(|seat| seat.id == id).map(|seat| seat.bankroll)
     }
 
+    /// Lets the transport find clients the rules have dropped — a seat can go
+    /// away without its owner asking, by running out of chips.
+    pub fn is_seated(&self, id: &str) -> bool {
+        self.seats.iter().any(|seat| seat.id == id)
+    }
+
     /// Seats a player. Anyone arriving mid-round sits out until the next deal.
     pub fn join(&mut self, id: &str, name: &str) -> Result<Vec<Event>, TableError> {
-        if self.seats.iter().any(|seat| seat.id == id) {
+        if self.is_seated(id) {
             return Err(TableError::AlreadySeated);
         }
         if self.seats.len() >= MAX_SEATS {
@@ -161,20 +167,23 @@ impl<R: Rng> Table<R> {
         Ok(events)
     }
 
-    /// Removes a player. A wager already on the felt is forfeited, and if the
-    /// table was waiting on them the round moves on rather than deadlocking.
-    pub fn leave(&mut self, id: &str) -> Vec<Event> {
+    /// Removes a player. A wager already on the felt is forfeited, and the
+    /// round moves on rather than deadlocking whether the table was waiting on
+    /// them to act or waiting on them to bet.
+    pub fn leave(&mut self, id: &str) -> Result<Vec<Event>, TableError> {
         let Some(index) = self.seats.iter().position(|seat| seat.id == id) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut events = vec![Event::Left { name: self.seats.remove(index).name }];
-        if self.turn.as_deref() == Some(id) {
-            let _ = self.advance_turn(&mut events);
-        }
         if self.seats.is_empty() {
             self.abandon_round();
+            return Ok(events);
         }
-        events
+        if self.turn.as_deref() == Some(id) {
+            self.advance_turn(&mut events)?;
+        }
+        self.deal_if_all_wagered(&mut events)?;
+        Ok(events)
     }
 
     pub fn apply(&mut self, id: &str, command: Command) -> Result<Vec<Event>, TableError> {
@@ -195,10 +204,18 @@ impl<R: Rng> Table<R> {
         seat.bankroll -= amount;
         seat.bet = amount;
         let mut events = vec![Event::BetPlaced { name: seat.name.clone(), amount }];
-        if self.seats.iter().all(|seat| seat.bet > 0) {
-            self.deal_round(&mut events)?;
-        }
+        self.deal_if_all_wagered(&mut events)?;
         Ok(events)
+    }
+
+    /// The only gate that starts a round. It has to be re-checked whenever the
+    /// set of seats changes, not just when a bet lands, or a player leaving
+    /// during betting wedges the table on a wager that will never arrive.
+    fn deal_if_all_wagered(&mut self, events: &mut Vec<Event>) -> Result<(), TableError> {
+        if self.phase != Phase::Betting || self.seats.iter().any(|seat| seat.bet == 0) {
+            return Ok(());
+        }
+        self.deal_round(events)
     }
 
     fn hit(&mut self, id: &str) -> Result<Vec<Event>, TableError> {
@@ -552,23 +569,38 @@ mod tests {
         let mut table = seated(rules(), &["a", "b"]);
         table.apply("a", Command::Bet(5)).expect("bet accepted");
         table.apply("b", Command::Bet(5)).expect("bet accepted");
-        table.leave("a");
+        table.leave("a").expect("the round moves on");
         assert!(table.bankroll("a").is_none());
         assert!(table.apply("b", Command::Stand).is_ok());
+    }
+
+    /// The regression that wedged a live table: one seat had wagered, the
+    /// other dropped its connection, and nothing re-checked the deal gate.
+    #[test]
+    fn a_player_disconnecting_before_betting_does_not_wedge_the_round() {
+        let mut table = seated(rules(), &["a", "b"]);
+        table.apply("a", Command::Bet(20)).expect("bet accepted");
+        assert_eq!(table.phase(), Phase::Betting, "the table is waiting on b");
+        table.leave("b").expect("the round moves on");
+        assert_eq!(table.phase(), Phase::PlayerTurns, "the deal must not need b");
+        while table.phase() == Phase::PlayerTurns {
+            table.apply("a", Command::Stand).expect("a can still act");
+        }
+        assert_eq!(table.phase(), Phase::Betting, "the next round is open");
     }
 
     #[test]
     fn the_last_player_leaving_returns_the_table_to_waiting() {
         let mut table = seated(rules(), &["a"]);
         table.apply("a", Command::Bet(5)).expect("bet accepted");
-        table.leave("a");
+        table.leave("a").expect("the table empties");
         assert_eq!(table.phase(), Phase::WaitingForPlayers);
     }
 
     #[test]
     fn leaving_a_seat_that_does_not_exist_is_a_no_op() {
         let mut table = seated(rules(), &["a"]);
-        assert!(table.leave("ghost").is_empty());
+        assert!(table.leave("ghost").expect("no seat, no events").is_empty());
     }
 
     #[test]
