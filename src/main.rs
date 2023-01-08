@@ -2,9 +2,9 @@
 //!
 //! One task owns the [`Table`] and is the only thing that mutates it, so the
 //! rules need no locks. Every connection is two tasks — a reader that turns
-//! lines into commands and a writer that drains a bounded mailbox — which
-//! avoids `select!` over [`AsyncBufReadExt::lines`] and the partial-line
-//! problems that come with cancelling a read.
+//! lines into commands and a writer that drains a bounded mailbox — so a
+//! client that has stopped reading blocks only its own writer, never the
+//! reader that is still feeding commands to the table.
 
 use blackjack_rust::config::Config;
 use blackjack_rust::protocol::{self, GREETING, HELP};

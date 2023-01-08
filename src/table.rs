@@ -364,8 +364,9 @@ impl<R: Rng> Table<R> {
         self.deck.draw().ok_or(TableError::ShoeExhausted)
     }
 
-    /// Cut card at 25% penetration, checked between rounds so a shuffle never
-    /// lands in the middle of a hand.
+    /// Cut card at 75% penetration — reshuffle once under a quarter of the
+    /// shoe is left, checked between rounds so a shuffle never lands in the
+    /// middle of a hand.
     fn replenish_at_cut_card(&mut self) {
         if self.deck.len() < 13 * self.rules.packs as usize {
             self.replenish();

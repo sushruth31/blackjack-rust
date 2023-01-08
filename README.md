@@ -4,13 +4,14 @@
 
 Up to seven people connect with `nc`, sit at one shared table, and play real
 blackjack: shoe, soft/hard aces, naturals at 3:2, dealer stand rules, bankrolls.
-The interesting part is not the card game — it is that the rules are a pure
-state machine (commands in, events out) that has never heard of a socket, so
-every rule in the game is tested without opening a port.
+The interesting part is not the card game — it is that the rules are an
+I/O-free state machine (commands in, events out) that has never heard of a
+socket, so every rule in the game is tested without opening a port.
 
 ## Stack
 
-- **Rust 2021**, no framework.
+- **Rust 2021**, no framework. MSRV 1.70, built by a pinned CI job rather than
+  asserted in `Cargo.toml` and hoped for.
 - **tokio 1.22** for the async runtime and TCP — one task per concern, and
   `mpsc` channels rather than `Arc<Mutex<Game>>`, so the rules need no locking.
 - **rand 0.8** for the shoe. `Table` is generic over `Rng`, which is what lets
@@ -81,17 +82,29 @@ on outcomes instead of on English.
   up more often. Fisher-Yates draws from `0..=i` instead and is uniform. A test
   asserts the shuffle is a permutation of the multiset and that a seed
   reproduces it exactly.
-- **Rules first, transport second.** `Table::apply` is a pure function from
-  `(state, Command)` to `Result<Vec<Event>, TableError>`. That is what makes a
-  300-round property test cheap: "if any player stood, the dealer's final total
-  is at least 17" is one assertion over real deals, not a mocked socket.
+- **Rules first, transport second.** The whole rules layer is I/O-free and
+  deterministic given a seeded RNG — commands in, events out, no socket
+  anywhere: `fn apply(&mut self, id: &str, command: Command) -> Result<Vec<Event>, TableError>`.
+  That is what makes a 300-round property test cheap: "if any player stood, the
+  dealer's final total is at least 17" is one assertion over real deals, not a
+  mocked socket.
 - **One task owns the table, and it never awaits a client.** Outbound lines go
   out with `try_send` into a 64-line bounded mailbox; a client that has stopped
   reading loses lines instead of stalling the round for the other six players.
   Inbound commands *do* await, because backpressure on a chatty client is the
-  correct behaviour. Each connection is a reader task plus a writer task rather
-  than one task with `select!`, because `AsyncBufReadExt::read_line` is not
-  cancellation safe and a cancelled read loses the line boundary.
+  correct behaviour. Reader and writer are separate tasks so that a writer
+  blocked on a full socket buffer cannot stall the reader feeding the table.
+  A failed `accept` is logged and skipped rather than returned: `EMFILE` is a
+  property of one connection, and exiting over it would drop six seated
+  players mid-round.
+- **The deal gate is re-checked whenever the seats change, not only on a bet.**
+  A round starts when *every* seat has wagered, so a player who disconnects
+  while the table is waiting on their bet is a liveness bug waiting to happen —
+  the other players' chips are already down and no deal ever comes. `leave`
+  runs the same gate `bet` does, and the case has a test named after it. A seat
+  the rules drop — disconnect, refused join, out of chips — also loses its
+  mailbox, which shuts its socket instead of leaving a spectator reading
+  everyone's cards.
 - **A seven-seat table is a `Vec`, not a `HashMap`.** Seat lookup is a linear
   scan over at most seven elements, which beats hashing a `String` key, and it
   gives the round its turn order for free — "next to act" is the first seat that
@@ -107,16 +120,18 @@ persistence — bankrolls live for the length of a connection.
 
 ## Tests
 
-`cargo test` — 68 tests, all green, ~1700 lines of source including them.
+`cargo test` — 69 tests, all green, ~1800 lines of source including them.
 
 - `src/hand.rs` — 13 tests on soft/hard totals: multiple aces, a soft total
   hardening on the next card, three-card 21 not counting as a natural.
 - `src/rules.rs` — 13 tests on dealer policy (S17 vs H17, and H17 not applying
   to a hard 17 that contains an ace), on the player-busts-first ordering, and on
   3:2 rounding.
-- `src/table.rs` — 17 tests on the round machine: a wager is deducted exactly
-  once, acting out of turn is refused, leaving on your own turn does not
-  deadlock the table, and 500 consecutive rounds always reach settlement.
+- `src/table.rs` — 18 tests on the round machine: a wager is deducted exactly
+  once, acting out of turn is refused, neither leaving on your own turn nor
+  disconnecting before you bet can wedge the table, and 500 consecutive rounds
+  each reopen betting and settle — the loop counts them and asserts the count,
+  so it cannot pass by stopping early.
 - `src/card.rs`, `src/protocol.rs`, `src/config.rs` — 21 tests on shoe
   composition and shuffle fairness, command parsing, and configuration that
   fails loudly with the offending variable named.

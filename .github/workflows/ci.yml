@@ -10,6 +10,7 @@ env:
 
 jobs:
   check:
+    name: fmt, clippy, test, build (stable)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,3 +32,19 @@ jobs:
 
       - name: Build
         run: cargo build --release
+
+  # An MSRV nobody builds is a claim, not a guarantee. This job is the proof
+  # behind `rust-version = "1.70"` in Cargo.toml, pinned against the committed
+  # lockfile so a dependency bump cannot raise it silently.
+  msrv:
+    name: check (1.70, the declared MSRV)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.70.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --locked --all-targets
