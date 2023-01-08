@@ -442,6 +442,11 @@ mod tests {
         events
     }
 
+    /// A long run of 5-chip wagers can lose at most 5 a round, so a bankroll
+    /// this deep cannot bust: the loops below end because they are done, never
+    /// because the table quietly dropped the players out from under them.
+    const DEEP_POCKETS: u32 = 3_000;
+
     fn settled_outcome(events: &[Event]) -> Option<Outcome> {
         events.iter().find_map(|event| match event {
             Event::Settled { outcome, .. } => Some(*outcome),
@@ -542,26 +547,37 @@ mod tests {
 
     #[test]
     fn five_hundred_rounds_always_reach_settlement() {
-        let mut table = seated(rules(), &["a", "b"]);
-        for _ in 0..500 {
-            if table.phase() != Phase::Betting {
-                break;
-            }
-            drain_round(&mut table);
-            assert_ne!(table.phase(), Phase::PlayerTurns, "round must settle");
+        let mut table = seated(Rules { starting_bankroll: DEEP_POCKETS, ..rules() }, &["a", "b"]);
+        let mut settlements = 0;
+        for round in 0..500 {
+            assert_eq!(table.phase(), Phase::Betting, "betting must reopen after round {}", round);
+            settlements += drain_round(&mut table);
+            assert_ne!(table.phase(), Phase::PlayerTurns, "round {} must settle", round);
         }
+        assert_eq!(settlements, 1_000, "both seats settle in each of the 500 rounds");
     }
 
-    fn drain_round(table: &mut Table<StdRng>) {
-        ["a", "b"].into_iter().for_each(|id| ignore(table.apply(id, Command::Bet(5))));
+    /// Bets for both seats, stands both out, and reports how many seats the
+    /// round actually settled — the loop above is only worth anything if that
+    /// number is two every time.
+    fn drain_round(table: &mut Table<StdRng>) -> usize {
+        let mut events = Vec::new();
+        for id in ["a", "b"] {
+            events.extend(table.apply(id, Command::Bet(5)).expect("every seat can cover 5"));
+        }
         while table.phase() == Phase::PlayerTurns {
-            ["a", "b"].into_iter().for_each(|id| ignore(table.apply(id, Command::Stand)));
+            ["a", "b"].into_iter().for_each(|id| events.extend(stand(table, id)));
         }
+        settlements(&events)
     }
 
-    /// Seats that are not up, or have already left, legitimately refuse.
-    fn ignore(result: Result<Vec<Event>, TableError>) {
-        let _ = result;
+    /// The seat that is not up legitimately refuses; only the other one acts.
+    fn stand(table: &mut Table<StdRng>, id: &str) -> Vec<Event> {
+        table.apply(id, Command::Stand).unwrap_or_default()
+    }
+
+    fn settlements(events: &[Event]) -> usize {
+        events.iter().filter(|event| matches!(event, Event::Settled { .. })).count()
     }
 
     #[test]
@@ -615,18 +631,21 @@ mod tests {
         assert_eq!(table.bankroll("a").is_none(), lost);
     }
 
+    /// Hitting until the hand closes burns roughly three cards a round, so two
+    /// hundred rounds on a single pack force the shoe to be rebuilt many times.
     #[test]
     fn the_shoe_is_replenished_rather_than_running_dry() {
-        let mut table = seated(Rules { packs: 1, ..rules() }, &["a"]);
-        for _ in 0..200 {
-            let mut events = match table.apply("a", Command::Bet(5)) {
-                Ok(events) => events,
-                Err(_) => break,
-            };
+        let deep = Rules { packs: 1, starting_bankroll: DEEP_POCKETS, ..rules() };
+        let mut table = seated(deep, &["a"]);
+        let mut settled = 0;
+        for round in 0..200 {
+            let mut events = table.apply("a", Command::Bet(5)).expect("the shoe is never dry");
             while table.phase() == Phase::PlayerTurns {
                 events.extend(table.apply("a", Command::Hit).expect("hit accepted"));
             }
-            assert!(settled_outcome(&events).is_some());
+            assert!(settled_outcome(&events).is_some(), "round {} must settle", round);
+            settled += settlements(&events);
         }
+        assert_eq!(settled, 200, "every round dealt from a shoe that was rebuilt in place");
     }
 }
