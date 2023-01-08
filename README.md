@@ -15,7 +15,7 @@ socket, so every rule in the game is tested without opening a port.
 - **tokio 1.22** for the async runtime and TCP — one task per concern, and
   `mpsc` channels rather than `Arc<Mutex<Game>>`, so the rules need no locking.
 - **rand 0.8** for the shoe. `Table` is generic over `Rng`, which is what lets
-  the integration tests replay 300 deterministic rounds from a seed.
+  the integration tests replay 700 deterministic rounds from a seed.
 - No serialization crate: the wire format is one line of text, so `nc` or
   `telnet` is a complete client.
 
