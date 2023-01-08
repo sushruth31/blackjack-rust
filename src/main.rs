@@ -51,9 +51,23 @@ async fn run() -> Result<(), Box<dyn Error>> {
     println!("blackjack table open on {}", config.bind_addr);
     let (requests, inbox) = mpsc::channel(MAILBOX_DEPTH);
     tokio::spawn(run_table(config.rules, inbox));
+    accept_forever(listener, requests).await
+}
+
+/// EMFILE, ECONNABORTED and friends are conditions of one connection, not of
+/// the listener, so they are logged and skipped. Only bind and config failures
+/// are fatal — dropping six seated players over a transient errno is not.
+async fn accept_forever(
+    listener: TcpListener,
+    requests: Sender<Request>,
+) -> Result<(), Box<dyn Error>> {
     loop {
-        let (stream, peer) = listener.accept().await?;
-        tokio::spawn(serve(stream, peer.to_string(), requests.clone()));
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                tokio::spawn(serve(stream, peer.to_string(), requests.clone()));
+            }
+            Err(error) => eprintln!("blackjack: accept failed, still serving: {}", error),
+        }
     }
 }
 
@@ -65,6 +79,10 @@ async fn run_table(rules: Rules, mut inbox: Receiver<Request>) {
     while let Some(Request { seat, input }) = inbox.recv().await {
         let result = dispatch(&mut table, &mut clients, &seat, input);
         publish(&clients, &seat, result);
+        // Whoever the rules no longer seat — a refused join, a player out of
+        // chips, a disconnect — loses their mailbox here, which shuts their
+        // socket. Otherwise they linger as spectators reading everyone's cards.
+        clients.retain(|id, _| table.is_seated(id));
     }
 }
 
@@ -117,14 +135,21 @@ async fn serve(stream: TcpStream, seat: SeatId, requests: Sender<Request>) {
     submit(&requests, &seat, Input::Leave).await;
 }
 
+/// Ends when the table drops this client's mailbox, and shuts the write half
+/// on the way out so a dropped player is told the connection is over.
 async fn drain(mut mailbox: Receiver<String>, mut writer: OwnedWriteHalf) {
     while let Some(line) = mailbox.recv().await {
         if writer.write_all(line.as_bytes()).await.is_err() {
             return;
         }
     }
+    let _ = writer.shutdown().await;
 }
 
+/// Hands the table the *only* strong sender for this mailbox and keeps a weak
+/// one, so that when the table drops the seat the channel closes, the writer
+/// shuts the socket, and this loop stops reading from a player who has no
+/// table to talk to.
 async fn read_commands(
     reader: OwnedReadHalf,
     seat: &str,
@@ -137,8 +162,12 @@ async fn read_commands(
     };
     let name = seat_name(&greeting, seat);
     let _ = outbox.try_send(HELP.to_string());
-    submit(requests, seat, Input::Join { name, outbox: outbox.clone() }).await;
+    let mailbox = outbox.downgrade();
+    submit(requests, seat, Input::Join { name, outbox }).await;
     while let Some(line) = lines.next_line().await? {
+        let Some(outbox) = mailbox.upgrade() else {
+            return Ok(());
+        };
         forward(&line, seat, requests, &outbox).await;
     }
     Ok(())
